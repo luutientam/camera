@@ -5,117 +5,113 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Xiaomi/Leica "leica_filter_param_*.bin" bank: per AI-scene tables that pick a 17^3 RGB8 LUT
- * from (lux index, CCT).
+ * Xiaomi/Leica "leica_filter_param_*.bin" (docs/spec_fullm9.md §5, docs/spec_donor120.md §5).
  *
- * Layout (little endian u16 unless noted):
- *   [0]      scene count (6)
- *   [1..6]   byte size of each scene block
- *   [7]      offset of the scene blocks (0x400)
- *   [8]      offset of LUT data (0x1000)
- *   [9]      LUT grid size (17)
- *   0x20     ascii "aiscene-lux-cct", 0x120 "uint16_t", 0x220 "0-1023"
- *   scene block: 64 byte name, numLux, { luxLo, luxHi, numCct, { cctLo, cctHi, lutIndex } * numCct } * numLux
- *   LUT data: lutCount * grid^3 * 3 bytes, R fastest
+ *   u16 nScenes; u16 sceneBlockSize[nScenes]; u16 sceneOff(0x400); u16 lutOff(0x1000); u16 lutDim(17);
+ *   u16 nZooms; u16 zoomBlockSize[nZooms]
+ *   @sceneOff: per scene  char name[64] + TREE
+ *   after the scenes: per zoom  f32 zoom + TREE  (indexes shading records)
+ *   TREE := u16 nLux { u16 lo, hi, nCct { u16 lo, hi, index } }
+ *   LUTs @lutOff: 17^3 entries, index ((r*17+g)*17+b)*3 (B fastest), bytes (B, G, R)
+ *   shading records after the LUTs: 8 x f32 each
  */
 class LeicaBank(private val raw: ByteArray) {
 
-    class CctBin(val lo: Int, val hi: Int, val lut: Int)
-    class LuxBin(val lo: Int, val hi: Int, val cct: List<CctBin>)
-    class Scene(val name: String, val lux: List<LuxBin>)
+    class Bin(val lo: Int, val hi: Int, val index: Int, val sub: List<Bin>)
 
     val grid: Int
-    val scenes: List<Scene>
-    private val dataOffset: Int
+    private val scenes = LinkedHashMap<String, List<Bin>>()
+    private val zooms = ArrayList<Float>()
+    private val zoomTrees = ArrayList<List<Bin>>()
+    private val lutOff: Int
     val lutCount: Int
+    private val shadeOff: Int
+    private val bb = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
 
     init {
-        val bb = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-        val sceneCount = bb.getShort(0).toInt()
-        val metaOffset = bb.getShort(14).toInt() and 0xffff
-        dataOffset = bb.getShort(16).toInt() and 0xffff
-        grid = bb.getShort(18).toInt()
-        val list = ArrayList<Scene>(sceneCount)
-        var p = metaOffset
-        for (i in 0 until sceneCount) {
-            val blockSize = bb.getShort(2 + i * 2).toInt() and 0xffff
-            val nameBytes = raw.copyOfRange(p, p + 64)
-            val name = String(nameBytes, Charsets.US_ASCII).substringBefore('\u0000').trim()
-            var q = p + 64
-            fun u16(): Int = (bb.getShort(q).toInt() and 0xffff).also { q += 2 }
-            val luxBins = ArrayList<LuxBin>()
-            repeat(u16()) {
-                val lo = u16(); val hi = u16()
-                val cct = ArrayList<CctBin>()
-                repeat(u16()) { cct += CctBin(u16(), u16(), u16()) }
-                luxBins += LuxBin(lo, hi, cct)
-            }
-            list += Scene(name, luxBins)
-            p += blockSize
-        }
-        scenes = list
-        val lutBytes = grid * grid * grid * 3
-        lutCount = (raw.size - dataOffset) / lutBytes
-    }
+        fun u16(o: Int) = bb.getShort(o).toInt() and 0xffff
+        val nScenes = u16(0)
+        var h = 2
+        val sceneSizes = IntArray(nScenes) { u16(h).also { h += 2 } }
+        val sceneOff = u16(h); h += 2
+        lutOff = u16(h); h += 2
+        grid = u16(h); h += 2
+        val nZooms = u16(h); h += 2
+        val zoomSizes = IntArray(nZooms) { u16(h).also { h += 2 } }
 
-    fun scene(name: String): Scene = scenes.firstOrNull { it.name == name } ?: scenes.first()
-
-    /** Weighted LUT indices for a lux index / CCT, bridging gaps between bins linearly. */
-    fun weights(scene: Scene, luxIndex: Float, cct: Float): List<Pair<Int, Float>> {
-        val out = HashMap<Int, Float>()
-        for ((luxBin, wl) in spans(scene.lux, luxIndex, { it.lo }, { it.hi })) {
-            for ((cctBin, wc) in spans(luxBin.cct, cct, { it.lo }, { it.hi })) {
-                out[cctBin.lut] = (out[cctBin.lut] ?: 0f) + wl * wc
+        fun tree(start: Int): List<Bin> {
+            var q = start
+            fun r() = u16(q).also { q += 2 }
+            return List(r()) {
+                val lo = r(); val hi = r()
+                val sub = List(r()) { Bin(r(), r(), r(), emptyList()) }
+                Bin(lo, hi, -1, sub)
             }
         }
-        return out.map { it.key to it.value }
+        var p = sceneOff
+        var maxIndex = 0
+        for (i in 0 until nScenes) {
+            val name = String(raw, p, 64, Charsets.US_ASCII).substringBefore('\u0000').trim()
+            val t = tree(p + 64)
+            t.forEach { l -> l.sub.forEach { maxIndex = maxOf(maxIndex, it.index) } }
+            scenes[name] = t
+            p += sceneSizes[i]
+        }
+        for (i in 0 until nZooms) {
+            zooms += bb.getFloat(p)
+            zoomTrees += tree(p + 4)
+            p += zoomSizes[i]
+        }
+        lutCount = maxIndex + 1
+        shadeOff = lutOff + lutCount * grid * grid * grid * 3
     }
 
-    private inline fun <T> spans(bins: List<T>, x: Float, lo: (T) -> Int, hi: (T) -> Int): List<Pair<T, Float>> {
-        if (bins.size == 1) return listOf(bins[0] to 1f)
-        if (x <= lo(bins.first())) return listOf(bins.first() to 1f)
-        for (i in bins.indices) {
-            val b = bins[i]
-            if (x >= lo(b) && x <= hi(b)) return listOf(b to 1f)
-            if (i + 1 < bins.size) {
-                val n = bins[i + 1]
-                if (x > hi(b) && x < lo(n)) {
-                    val t = (x - hi(b)) / (lo(n) - hi(b)).toFloat()
-                    val s = t * t * (3 - 2 * t) // smoothstep keeps the transition visually soft
-                    return listOf(b to 1 - s, n to s)
-                }
+    private fun find(list: List<Bin>, v: Int): Pair<Bin, Bin> {
+        for ((i, b) in list.withIndex()) if (v <= b.hi) return if (v >= b.lo || i == 0) b to b else list[i - 1] to b
+        return list.last() to list.last()
+    }
+
+    private fun frac(v: Int, a: Bin, b: Bin): Float = (b.lo - a.hi).let { if (it == 0) 0f else (v - a.hi).toFloat() / it }
+
+    /** Exact LeicaParams.corners: bilinear weights over the lux gap and the CCT gaps. */
+    fun corners(tree: List<Bin>, lux: Int, cct: Int): LinkedHashMap<Int, Float> {
+        val (l0, l1) = find(tree, lux)
+        val (c00, c01) = find(l0.sub, cct)
+        val (c10, c11) = find(l1.sub, cct)
+        val fl = frac(lux, l0, l1); val f0 = frac(cct, c00, c01); val f1 = frac(cct, c10, c11)
+        val m = LinkedHashMap<Int, Float>()
+        fun add(i: Int, w: Float) { m[i] = (m[i] ?: 0f) + w }
+        add(c00.index, (1 - fl) * (1 - f0)); add(c01.index, (1 - fl) * f0)
+        add(c10.index, fl * (1 - f1)); add(c11.index, fl * f1)
+        return m
+    }
+
+    /**
+     * Blended LUT for a scene as standard R-fastest RGB floats in [0,1] (ready for a GL 3D texture),
+     * reproducing the native byte truncation of the blend.
+     */
+    fun lut(scene: String, lux: Int, cct: Int, dst: FloatArray) {
+        val w = corners(scenes[scene] ?: scenes["common"]!!, lux, cct)
+        val n = grid; val bytes = n * n * n * 3
+        for (r in 0 until n) for (g in 0 until n) for (b in 0 until n) {
+            val src = ((r * n + g) * n + b) * 3          // native layout: B fastest, bytes B,G,R
+            val dstI = ((b * n + g) * n + r) * 3        // GL layout: R fastest, RGB
+            for (c in 0 until 3) {
+                var acc = 0f
+                for ((i, wt) in w) acc += wt * (raw[lutOff + i * bytes + src + (2 - c)].toInt() and 0xff)
+                dst[dstI + c] = (if (w.size == 1) acc else acc.toInt().toFloat()) / 255f
             }
         }
-        return listOf(bins.last() to 1f)
     }
 
-    /** Blends the weighted LUTs into [dst] (RGB float, R fastest). */
-    fun blend(weights: List<Pair<Int, Float>>, dst: FloatArray) {
-        val count = grid * grid * grid
-        java.util.Arrays.fill(dst, 0, count * 3, 0f)
-        val lutBytes = count * 3
-        for ((index, w) in weights) {
-            if (w <= 0f) continue
-            val base = dataOffset + index.coerceIn(0, lutCount - 1) * lutBytes
-            val k = w / 255f
-            for (i in 0 until lutBytes) dst[i] += (raw[base + i].toInt() and 0xff) * k
-        }
+    /** 8 shading floats for the zoom/lux/CCT (radial vignette + luma sigmoid parameters). */
+    fun shading(zoom: Float, lux: Int, cct: Int): FloatArray {
+        val zi = zooms.indexOfLast { zoom >= it }.coerceAtLeast(0)
+        val w = corners(zoomTrees[zi], lux, cct)
+        return FloatArray(8) { k -> w.entries.sumOf { (i, wt) -> (wt * bb.getFloat(shadeOff + i * 32 + 4 * k)).toDouble() }.toFloat() }
     }
 
-    /** True when every LUT in the bank is (near) identity, e.g. the M3 / M10R banks. */
-    fun isIdentity(): Boolean {
-        val n1 = grid - 1
-        for (l in 0 until lutCount) {
-            var p = dataOffset + l * grid * grid * grid * 3
-            for (b in 0 until grid) for (g in 0 until grid) for (r in 0 until grid) {
-                if (kotlin.math.abs((raw[p].toInt() and 0xff) - (r * 255f / n1)) > 1.5f) return false
-                if (kotlin.math.abs((raw[p + 1].toInt() and 0xff) - (g * 255f / n1)) > 1.5f) return false
-                if (kotlin.math.abs((raw[p + 2].toInt() and 0xff) - (b * 255f / n1)) > 1.5f) return false
-                p += 3
-            }
-        }
-        return true
-    }
+    fun hasShading() = shadeOff + 32 <= raw.size
 
     companion object {
         fun load(assets: AssetManager, path: String) = LeicaBank(assets.open(path).use { it.readBytes() })

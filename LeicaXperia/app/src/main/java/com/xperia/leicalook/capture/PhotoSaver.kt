@@ -74,7 +74,7 @@ object PhotoSaver {
         }
         r.get(CaptureResult.SENSOR_SENSITIVITY)?.let {
             val boost = r.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100
-            exif.setAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, (it * boost / 100).toString())
+            exif.setAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS, (it * boost / 100).toString())
         }
         r.get(CaptureResult.LENS_APERTURE)?.let { exif.setAttribute(ExifInterface.TAG_F_NUMBER, it.toString()) }
         r.get(CaptureResult.LENS_FOCAL_LENGTH)?.let { f ->
@@ -83,10 +83,25 @@ object PhotoSaver {
         r.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)?.let {
             exif.setAttribute(ExifInterface.TAG_EXPOSURE_BIAS_VALUE, "$it/12")
         }
-        exif.setAttribute(ExifInterface.TAG_WHITE_BALANCE, ExifInterface.WHITE_BALANCE_AUTO.toString())
+        exif.setAttribute(ExifInterface.TAG_WHITE_BALANCE, "0")
         exif.setAttribute(ExifInterface.TAG_FLASH, "0")
-        meta.location?.let { exif.setGpsInfo(it) }
+        meta.location?.let { loc ->
+            exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE, dms(loc.latitude))
+            exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE_REF, if (loc.latitude >= 0) "N" else "S")
+            exif.setAttribute(ExifInterface.TAG_GPS_LONGITUDE, dms(loc.longitude))
+            exif.setAttribute(ExifInterface.TAG_GPS_LONGITUDE_REF, if (loc.longitude >= 0) "E" else "W")
+            if (loc.hasAltitude()) {
+                exif.setAttribute(ExifInterface.TAG_GPS_ALTITUDE, rational(loc.altitude))
+                exif.setAttribute(ExifInterface.TAG_GPS_ALTITUDE_REF, if (loc.altitude >= 0) "0" else "1")
+            }
+        }
         exif.saveAttributes()
+    }
+
+    private fun dms(v: Double): String {
+        val a = abs(v)
+        val d = a.toInt(); val m = ((a - d) * 60).toInt(); val sec = (a - d - m / 60.0) * 3600
+        return "$d/1,$m/1,${Math.round(sec * 1000)}/1000"
     }
 
     private fun rational(v: Double): String {

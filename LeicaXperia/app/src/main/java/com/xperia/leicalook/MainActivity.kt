@@ -40,6 +40,7 @@ import com.xperia.leicalook.look.Look
 import com.xperia.leicalook.look.LookCatalog
 import com.xperia.leicalook.look.LookEngine
 import com.xperia.leicalook.look.LookState
+import com.xperia.leicalook.look.Pipeline
 import com.xperia.leicalook.neural.M9Style
 import com.xperia.leicalook.ui.PreviewOverlay
 import com.xperia.leicalook.ui.ShutterButton
@@ -82,6 +83,12 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
     private var lastUri: Uri? = null
     private var m9: M9Style? = null
 
+    companion object {
+        private const val PREVIEW_OUT_W = 3024
+        private const val PREVIEW_OUT_H = 4032
+        private val DEFAULT_MU = floatArrayOf(0.45f, 0.55f, 0.75f, 0.3f, 0.4f, 0.25f, 0.4f, 0.38f, 0.36f)
+    }
+
     private val aspects = listOf("4:3" to 4f / 3f, "3:2" to 1.5f, "16:9" to 16f / 9f, "1:1" to 1f)
     // Leica focal lengths mapped onto the Xperia 1 IV's 24 mm main camera.
     private val focalStops = listOf(16, 24, 35, 50, 85, 125)
@@ -97,8 +104,8 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
         engine = LookEngine(assets)
         looks = LookCatalog.all(engine.toneCount())
         camera = CameraController(this, this)
-        processor = StillProcessor(this, engine, this)
-        bg.execute { m9 = M9Style.create(this, engine) }
+        processor = StillProcessor(this, engine, { if (aiEnabled) m9 else null }, this)
+        bg.execute { m9 = M9Style.create(this, engine); main.post { updateGrab(); pushState() } }
 
         glView = findViewById(R.id.preview)
         overlay = findViewById(R.id.overlay)
@@ -137,8 +144,7 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
 
     private fun layoutPreview() {
         val root = findViewById<View>(R.id.root)
-        root.setOnApplyWindowInsetsListener { _, insets ->
-            val top = insets.getInsets(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()).top
+        fun apply(top: Int) {
             val w = resources.displayMetrics.widthPixels
             val topBar = findViewById<View>(R.id.topBar)
             (topBar.layoutParams as FrameLayout.LayoutParams).topMargin = top
@@ -148,8 +154,13 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
             lp.height = w * 4 / 3
             lp.topMargin = top + dp(52)
             frame.layoutParams = lp
+        }
+        apply(dp(28))
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            apply(insets.getInsets(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()).top)
             insets
         }
+        root.requestApplyInsets()
     }
 
     // ---------------------------------------------------------------- permissions & lifecycle
@@ -210,9 +221,8 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
         val s = i.scene.update(result) ?: return
         scene = s
         val l = look ?: return
-        val before = engine.currentBankVersion
-        if (l.bank != null && engine.updateBank(l, s) != before) pushState()
-        m9?.onPreviewScene(s)
+        val before = engine.bank.version
+        if (l.bank != null && engine.updateBank(l.bank, s, camera.zoom).version != before) pushState()
         val now = System.currentTimeMillis()
         if (now - lastInfoUpdate > 400) {
             lastInfoUpdate = now
@@ -238,14 +248,13 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
         // Re-pick the bank LUT from the still's own exposure/AWB, not the preview's.
         val shotScene = info.scene.estimate(result) ?: scene
         val state = if (l.bank != null) {
-            val lut = engine.blendBank(l.bank, l.bankScene, shotScene?.luxIndex ?: 200f, shotScene?.cct ?: 5000f)
-            baseState.copy(bankVersion = engine.publishBankForStill(lut))
+            val r = engine.blend(l.bank, (shotScene?.luxIndex ?: 200f).roundToInt(), (shotScene?.cct ?: 5000f).roundToInt(), request.zoom)
+            baseState.copy(bankVersion = r.version, shade = r.shade)
         } else baseState
         val rot = StillProcessor.stillRotation(info.characteristics, request.deviceRotation)
-        val refiner = if (l.neural && aiEnabled) m9?.refiner(shotScene, baseState.styleAmount) else null
         processor.submit(
             image, rot, info.facing == CameraCharacteristics.LENS_FACING_FRONT, aspects[aspectIndex].second,
-            state, l.name, result, refiner, lastLocation(),
+            state, l.needsStats, l.pipeline == Pipeline.TONE, l.name, result, lastLocation(),
         )
     }
 
@@ -324,7 +333,7 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
 
     private fun selectLook(l: Look, user: Boolean) {
         look = l
-        lookName.text = l.name
+        lookName.text = "${l.name}  ·  ${l.subtitle.uppercase()}"
         prefs.edit().putString("look", l.id).apply()
         val strip = findViewById<LinearLayout>(R.id.lookStrip)
         for (i in 0 until strip.childCount) {
@@ -336,8 +345,10 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
         val p = ((intensities[l.id] ?: l.defaultIntensity) * 100).roundToInt()
         intensity.progress = p
         findViewById<TextView>(R.id.intensityLabel).text = "$p%"
-        if (l.bank != null) engine.updateBank(l, scene)
+        if (l.bank != null) engine.updateBank(l.bank, scene, camera.zoom)
+        engine.lm9Mu = null
         if (user) vibrate()
+        updateGrab()
         pushState()
     }
 
@@ -352,14 +363,37 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
     private fun currentState(): LookState {
         val l = look ?: return LookState()
         val k = intensities[l.id] ?: l.defaultIntensity
-        val styleOn = l.neural && aiEnabled && (m9?.ready == true)
-        return LookState(
-            bankKey = l.bank, bankVersion = engine.currentBankVersion, bankAmount = if (l.bank != null) k else 0f,
-            styleVersion = engine.currentStyleVersion, styleAmount = if (styleOn) k else 0f,
-            lutAsset = l.lut, lutAmount = if (l.lut != null) k else 0f, tone = l.tone,
-            mono = l.mono, monoWeights = l.monoWeights, contrast = l.contrast * k,
-            filmAmount = k,
+        val base = LookCatalog.state(l, k)
+        val styleOn = base.style && aiEnabled && m9?.ready == true && engine.currentStyleVersion != 0
+        val bank = engine.bank
+        return base.copy(
+            style = styleOn, styleVersion = engine.currentStyleVersion,
+            bankVersion = bank.version, shade = if (l.bank != null) bank.shade else null,
+            lm9Mu = if (l.needsStats) engine.lm9Mu ?: DEFAULT_MU else null,
         )
+    }
+
+    /** Small-frame grabs feed the M9 encoder (neural looks) and the L-M9 class statistics. */
+    private fun updateGrab() {
+        val l = look
+        val wantNeural = l != null && l.neural && aiEnabled && m9 != null
+        val wantStats = l != null && l.needsStats
+        if (!wantNeural && !wantStats) { renderer.grabListener = null; return }
+        val (gw, gh) = M9Style.lowresSize(3, 4)
+        renderer.grabW = gw; renderer.grabH = gh
+        renderer.grabListener = PreviewRenderer.GrabListener { buf, w, h ->
+            bg.execute {
+                try {
+                    if (wantNeural) m9?.updatePreview(buf, w, h, PREVIEW_OUT_W, PREVIEW_OUT_H)
+                    if (wantStats) engine.lm9Mu = LookEngine.lm9Means(buf, w, h)
+                } catch (e: Throwable) {
+                    android.util.Log.w("MainActivity", "grab", e)
+                } finally {
+                    renderer.grabDone()
+                    main.post { pushState() }
+                }
+            }
+        }
     }
 
     fun pushState() {
@@ -392,6 +426,7 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
             aiEnabled = !aiEnabled
             prefs.edit().putBoolean("ai", aiEnabled).apply()
             updateAiButton()
+            updateGrab()
             showToast(if (aiEnabled) "AI Leica: BẬT" else "AI Leica: TẮT (chỉ LUT)")
             pushState()
         }

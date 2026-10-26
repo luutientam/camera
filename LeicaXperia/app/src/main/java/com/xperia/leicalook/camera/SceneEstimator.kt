@@ -88,13 +88,8 @@ class SceneEstimator(chars: CameraCharacteristics) {
     }
 
     companion object {
-        /**
-         * Qualcomm lux index steps by ~1.03x of exposure per unit (one EV ~= 23.45 units).
-         * Anchored so that bright daylight (EV 15) lands ~120 and EV 9.4 lands on the
-         * 260 day/indoor threshold used by the Leica style models.
-         */
-        fun luxIndexFromEv(ev100: Float): Float =
-            (120f + (15f - ev100) * (1f / log2(1.03f))).coerceIn(0f, 999f)
+        /** fullm9 fallback when no Qualcomm vendor tag: clamp(474.9 - 23.45 * EV100, 0, 999); higher = darker. */
+        fun luxIndexFromEv(ev100: Float): Float = (474.9f - 23.45f * ev100).coerceIn(0f, 999f)
 
         private fun ColorSpaceTransform.toMatrix(): DoubleArray {
             val out = DoubleArray(9)

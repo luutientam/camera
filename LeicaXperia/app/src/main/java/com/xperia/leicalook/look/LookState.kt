@@ -14,6 +14,8 @@ data class LookState(
     val style: Boolean = false,
     val bankKey: String? = null,
     val bankVersion: Int = 0,
+    /** Leica shading record (8 floats) applied after the bank LUT, or null. */
+    val shade: FloatArray? = null,
     val warmEv: Float = 0f,
     val warmNeutral: Float = 0f,
     /** M9+ boostSaturationContrast: saturation, contrast, warm (0 = off). */

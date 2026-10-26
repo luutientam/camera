@@ -14,19 +14,23 @@ import com.xperia.leicalook.gl.EglOffscreen
 import com.xperia.leicalook.gl.Gl
 import com.xperia.leicalook.gl.LookProgram
 import com.xperia.leicalook.gl.LookTextures
+import com.xperia.leicalook.look.LookEngine
 import com.xperia.leicalook.look.LookState
+import com.xperia.leicalook.neural.M9Style
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
  * Full-resolution still pipeline on its own GL context:
- *   YUV_420_888 planes -> (same look shader as preview) -> rotate/crop -> RGBA readback
- *   -> optional neural refinement -> JPEG + EXIF -> MediaStore.
+ *   YUV_420_888 planes -> [half-res upright pass -> M9 encoder maps, L-M9 probe]
+ *   -> full-res look pass (same shader as preview) with rotate/crop -> RGBA readback
+ *   -> NightHighlights shoulder (cameralook tones) -> JPEG + EXIF -> MediaStore.
  * The camera Image is copied and closed immediately so burst shooting is not blocked.
  */
 class StillProcessor(
     private val context: Context,
-    lutSource: LookTextures.LutSource,
+    private val engine: LookEngine,
+    private val m9: () -> M9Style?,
     private val listener: Listener,
 ) {
     interface Listener {
@@ -35,30 +39,21 @@ class StillProcessor(
         fun onQueueChanged(pending: Int)
     }
 
-    /** Post-GPU refinement step (neural style); returns the bitmap to save. */
-    fun interface Refiner {
-        fun refine(bitmap: Bitmap, result: CaptureResult): Bitmap
-    }
-
     class Job(
         val y: ByteBuffer, val uv: ByteBuffer, val width: Int, val height: Int,
         val rotation: Int, val mirror: Boolean, val aspect: Float,
-        val state: LookState, val lookName: String, val result: CaptureResult,
-        val refiner: Refiner?, val location: android.location.Location?,
+        val state: LookState, val lm9: Boolean, val nightShoulder: Boolean,
+        val lookName: String, val result: CaptureResult, val location: android.location.Location?,
     )
 
     private val thread = HandlerThread("still").apply { start() }
     private val handler = Handler(thread.looper)
     private var egl: EglOffscreen? = null
     private var program: LookProgram? = null
-    private val textures = LookTextures().apply { source = lutSource }
+    private val textures = LookTextures().apply { source = engine }
     private var yTex = 0
     private var uvTex = 0
-    private var fbo = 0
-    private var fboTex = 0
-    private var fboW = 0
-    private var fboH = 0
-    private var readBuf: ByteBuffer? = null
+    private val fbos = HashMap<Long, IntArray>()
     @Volatile private var pending = 0
 
     init {
@@ -73,8 +68,8 @@ class StillProcessor(
 
     /** Copies the planes out of [image] and closes it; processing continues asynchronously. */
     fun submit(
-        image: Image, rotation: Int, mirror: Boolean, aspect: Float, state: LookState,
-        lookName: String, result: CaptureResult, refiner: Refiner?, location: android.location.Location?,
+        image: Image, rotation: Int, mirror: Boolean, aspect: Float, state: LookState, lm9: Boolean,
+        nightShoulder: Boolean, lookName: String, result: CaptureResult, location: android.location.Location?,
     ) {
         val w = image.width; val h = image.height
         val y = ByteBuffer.allocateDirect(w * h)
@@ -86,7 +81,7 @@ class StillProcessor(
         }
         pending++
         listener.onQueueChanged(pending)
-        val job = Job(y, uv, w, h, rotation, mirror, aspect, state, lookName, result, refiner, location)
+        val job = Job(y, uv, w, h, rotation, mirror, aspect, state, lm9, nightShoulder, lookName, result, location)
         handler.post { run(job) }
     }
 
@@ -122,28 +117,64 @@ class StillProcessor(
 
     private fun run(job: Job) {
         val t0 = System.currentTimeMillis()
+        var styleVersion = 0
         try {
             egl!!.makeCurrent()
-            val bmp = render(job)
-            val refined = job.refiner?.let {
-                try { it.refine(bmp, job.result) } catch (e: Throwable) { Log.e(TAG, "refine failed", e); bmp }
-            } ?: bmp
-            val uri = PhotoSaver.save(context, refined, PhotoSaver.Meta(job.result, job.lookName, location = job.location))
+            uploadYuv(job)
+            val rot = ((job.rotation % 360) + 360) % 360
+            val tex = rotationMatrix(rot, job.mirror)
+            val rw = if (rot % 180 == 0) job.width else job.height
+            val rh = if (rot % 180 == 0) job.height else job.width
+            var state = job.state
+
+            // Pass 1: un-graded upright frame at half resolution (GL_LINEAR at exactly 2x = the donor's 2x2 box).
+            if (state.style || job.lm9) {
+                val hw = rw / 2; val hh = rh / 2
+                val half = renderToBuffer(tex, LookState.BYPASS, hw, hh, rw.toFloat() / rh)
+                if (state.style) {
+                    val maps = m9()?.maps(half, hw, hh, rw, rh, temporal = false)
+                    if (maps != null) {
+                        styleVersion = engine.publishStillStyle(maps)
+                        state = state.copy(styleVersion = styleVersion)
+                    } else state = state.copy(style = false)
+                }
+                if (job.lm9) {
+                    val pw = 320; val ph = maxOf(1, Math.round(rh * 320f / rw))
+                    val probe = renderToBuffer(tex, LookState.BYPASS, pw, ph, rw.toFloat() / rh)
+                    state = state.copy(lm9Mu = LookEngine.lm9Means(probe, pw, ph))
+                }
+            }
+
+            // Pass 2: full resolution, rotated upright, centre-cropped to the requested aspect.
+            val long = maxOf(rw, rh); val short = minOf(rw, rh)
+            val wantLong = minOf(long, (short * job.aspect).toInt())
+            val outW = if (rw >= rh) wantLong else short
+            val outH = if (rw >= rh) short else wantLong
+            val cu = (1f - outW.toFloat() / rw) / 2f
+            val cv = (1f - outH.toFloat() / rh) / 2f
+            state = state.copy(crop = floatArrayOf(cu, cv, 1f - cu, 1f - cv))
+            val buf = renderToBuffer(tex, state, outW, outH, rw.toFloat() / rh)
+            val bmp = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+            bmp.copyPixelsFromBuffer(buf)
+            if (job.nightShoulder) NightHighlights.apply(bmp)
+
+            val uri = PhotoSaver.save(context, bmp, PhotoSaver.Meta(job.result, job.lookName, location = job.location))
             val thumbW = 240
-            val thumb = Bitmap.createScaledBitmap(refined, thumbW, thumbW * refined.height / refined.width, true)
-            if (refined !== bmp) bmp.recycle()
-            refined.recycle()
+            val thumb = Bitmap.createScaledBitmap(bmp, thumbW, thumbW * bmp.height / bmp.width, true)
+            bmp.recycle()
             listener.onSaved(uri, thumb, System.currentTimeMillis() - t0)
         } catch (e: Throwable) {
             Log.e(TAG, "still failed", e)
             listener.onFailed(e.message ?: e.javaClass.simpleName)
         } finally {
+            if (styleVersion != 0) engine.release(styleVersion)
+            if (job.state.bankKey != null) engine.release(job.state.bankVersion)
             pending--
             listener.onQueueChanged(pending)
         }
     }
 
-    private fun render(job: Job): Bitmap {
+    private fun uploadYuv(job: Job) {
         val w = job.width; val h = job.height
         GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, yTex)
@@ -151,38 +182,44 @@ class StillProcessor(
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, uvTex)
         GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RG8, w / 2, h / 2, 0, GLES30.GL_RG, GLES30.GL_UNSIGNED_BYTE, job.uv)
         Gl.check("upload yuv")
+        texel[0] = 1f / w; texel[1] = 1f / h
+    }
 
-        // Output geometry: rotate to upright, then centre-crop to the requested aspect (long/short).
-        val rot = ((job.rotation % 360) + 360) % 360
-        val rw = if (rot % 180 == 0) w else h
-        val rh = if (rot % 180 == 0) h else w
-        val long = maxOf(rw, rh); val short = minOf(rw, rh)
-        val wantLong = minOf(long, (short * job.aspect).toInt())
-        val outW = if (rw >= rh) wantLong else short
-        val outH = if (rw >= rh) short else wantLong
-        val cu = (1f - outW.toFloat() / rw) / 2f
-        val cv = (1f - outH.toFloat() / rh) / 2f
-        val state = job.state.copy(crop = floatArrayOf(cu, cv, 1f - cu, 1f - cv))
+    private val texel = FloatArray(2)
+    private val mvp = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }
 
-        ensureFbo(outW, outH)
+    /** Renders [state] into an RGBA8 buffer of w x h whose row 0 is the top of the image. */
+    private fun renderToBuffer(tex: FloatArray, state: LookState, w: Int, h: Int, frameAspect: Float): ByteBuffer {
+        val fbo = fbo(w, h)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
-        GLES30.glViewport(0, 0, outW, outH)
+        GLES30.glViewport(0, 0, w, h)
         textures.sync(state)
-        val mvp = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }
-        program!!.draw(
-            intArrayOf(yTex, uvTex), rotationMatrix(rot, job.mirror), mvp, textures, state,
-            outW, outH, floatArrayOf(outW.toFloat(), outH.toFloat()), floatArrayOf(1f / w, 1f / h),
-        )
-        val buf = readBuf?.takeIf { it.capacity() >= outW * outH * 4 }
-            ?: ByteBuffer.allocateDirect(outW * outH * 4).order(ByteOrder.nativeOrder()).also { readBuf = it }
-        buf.clear()
-        GLES30.glReadPixels(0, 0, outW, outH, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buf)
+        program!!.draw(intArrayOf(yTex, uvTex), tex, mvp, textures, state, false,
+            floatArrayOf(w.toFloat(), h.toFloat()), texel, frameAspect)
+        val buf = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+        GLES30.glReadPixels(0, 0, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buf)
         Gl.check("readPixels")
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         buf.position(0)
-        val bmp = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
-        bmp.copyPixelsFromBuffer(buf)
-        return bmp
+        return buf
+    }
+
+    private fun fbo(w: Int, h: Int): Int {
+        val key = (w.toLong() shl 32) or h.toLong()
+        fbos[key]?.let { return it[0] }
+        if (fbos.size > 4) {
+            fbos.values.forEach { GLES30.glDeleteFramebuffers(1, intArrayOf(it[0]), 0); Gl.deleteTexture(it[1]) }
+            fbos.clear()
+        }
+        val t = Gl.genTexture(GLES30.GL_TEXTURE_2D)
+        GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, GLES30.GL_RGBA8, w, h)
+        val ids = IntArray(1)
+        GLES30.glGenFramebuffers(1, ids, 0)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, ids[0])
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, t, 0)
+        check(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) == GLES30.GL_FRAMEBUFFER_COMPLETE) { "fbo incomplete" }
+        fbos[key] = intArrayOf(ids[0], t)
+        return ids[0]
     }
 
     /**
@@ -204,24 +241,6 @@ class StillProcessor(
             0f, 0f, 1f, 0f,
             c, f, 0f, 1f,
         )
-    }
-
-    private fun ensureFbo(w: Int, h: Int) {
-        if (fbo != 0 && fboW == w && fboH == h) return
-        if (fbo != 0) {
-            GLES30.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
-            Gl.deleteTexture(fboTex)
-        }
-        fboTex = Gl.genTexture(GLES30.GL_TEXTURE_2D)
-        GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, GLES30.GL_RGBA8, w, h)
-        val ids = IntArray(1)
-        GLES30.glGenFramebuffers(1, ids, 0)
-        fbo = ids[0]
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
-        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, fboTex, 0)
-        check(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) == GLES30.GL_FRAMEBUFFER_COMPLETE) { "fbo incomplete" }
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-        fboW = w; fboH = h
     }
 
     fun release() {
