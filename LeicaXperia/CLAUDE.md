@@ -72,6 +72,17 @@ and `MainActivity` all use it. It launches on the phone without crashing.
 Look data versions (bank LUTs, style maps) share one counter in `LookEngine`. Versions created for a still are pinned until
 `StillProcessor` releases them, because the preview publishes about 7 versions/s and prunes old ones.
 
+**Session 2026-10-27 (emulator, the Xperia was unplugged):**
+- Fixed: the preview frame was full-screen because the insets listener never fired. `layoutPreview()` now applies a
+  default and calls `requestApplyInsets()`.
+- Fixed: AI stills had a strong green cast. In `LookProgram.draw()`, `identityTex()`/`zeroTex2D()` were created after the
+  inputs were bound; creating them re-binds the active unit and wiped the UV plane on the first draw of each GL context.
+  They are now created before binding. Keep it that way.
+- Still lowres for the M9 encoder is now capped at 1024 px on the long side (`STILL_LOWRES_LONG`). ORT runs 4 intra-op
+  threads. A 12 MP half-res input would take several seconds on the CPU.
+- Verified on the emulator, all saved correctly: STANDARD, M9, M9+, M10-R, L-M9, M3, Fuji CC II, Pearl, Pocket. On the
+  emulator the GPU/CPU is very slow, so its timings mean nothing.
+
 **Next:** test on the phone. Check the preview frame rate (`dumpsys SurfaceFlinger --latency "<SurfaceView ...(BLAST)#n>"`;
 gfxinfo only sees the UI thread), take photos with each look, pull them from `DCIM/LeicaLook`, and inspect them. Compare
 against the Python references (`docs/tools/cameralook_ref.py`, onnxruntime on m9_distill.onnx). Then tune the warm guess

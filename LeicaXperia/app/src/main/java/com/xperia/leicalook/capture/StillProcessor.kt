@@ -132,7 +132,10 @@ class StillProcessor(
 
             // Pass 1: un-graded upright frame at half resolution (GL_LINEAR at exactly 2x = the donor's 2x2 box).
             if (state.style || job.lm9) {
-                val hw = rw / 2; val hh = rh / 2
+                // Donor: lowres = 2x2 box of the full image. Capped at 1024 px on the long side so the CPU
+                // encoder stays well under a second on 12 MP (the coefficient grid is still 48x64 cells).
+                val k = minOf(0.5f, STILL_LOWRES_LONG / maxOf(rw, rh).toFloat())
+                val hw = maxOf(16, Math.round(rw * k)); val hh = maxOf(16, Math.round(rh * k))
                 val half = renderToBuffer(tex, LookState.BYPASS, hw, hh, rw.toFloat() / rh)
                 lap("half")
                 if (state.style) {
@@ -261,6 +264,7 @@ class StillProcessor(
 
     companion object {
         private const val TAG = "StillProcessor"
+        private const val STILL_LOWRES_LONG = 1024f
 
         /** Clockwise rotation that makes the sensor image upright for the current device rotation. */
         fun stillRotation(chars: CameraCharacteristics, deviceDegrees: Int): Int {

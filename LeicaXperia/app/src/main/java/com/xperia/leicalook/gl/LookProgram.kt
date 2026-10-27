@@ -40,6 +40,10 @@ class LookProgram(private val input: Input) {
         GLES30.glUniformMatrix4fv(u("uMvp"), 1, false, mvp, 0)
         GLES30.glUniform1f(u("uFlipY"), if (flipY) 1f else 0f)
 
+        // Create the fallback textures BEFORE binding inputs: creation binds on the active unit and would
+        // otherwise replace the input texture bound there (first draw of each context lost the UV plane).
+        val id3 = textures.identityTex()
+        val id2 = textures.zeroTex2D()
         var unit = 0
         fun bind(target: Int, tex: Int, name: String) {
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + unit)
@@ -53,8 +57,6 @@ class LookProgram(private val input: Input) {
             bind(GLES30.GL_TEXTURE_2D, inputs[0], "uY")
             bind(GLES30.GL_TEXTURE_2D, inputs[1], "uUV")
         }
-        val id3 = textures.identityTex()
-        val id2 = textures.zeroTex2D()
         val bankOn = state.bankKey != null && textures.bankTex != 0
         val lutOn = state.lutAsset != null && textures.lutTex != 0
         val styleOn = state.style && textures.styleReady
