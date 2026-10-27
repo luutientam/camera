@@ -262,6 +262,24 @@ class MainActivity : Activity(), CameraController.Listener, StillProcessor.Liste
         main.post { showToast(message) }
     }
 
+    private var lastFatal = 0L
+
+    override fun onFatal(cameraId: String, message: String) {
+        main.post {
+            val st = surfaceTexture ?: return@post
+            val now = System.currentTimeMillis()
+            // One reopen per 3 s at most, so a camera that keeps failing cannot loop.
+            if (!useFront && now - lastFatal < 3000) { showToast("Camera lỗi: $message"); return@post }
+            lastFatal = now
+            if (useFront) {
+                // Fall back to the rear camera rather than leaving a frozen frame.
+                useFront = false
+                showToast("Camera trước lỗi, quay về camera sau")
+            } else showToast("Camera lỗi, đang mở lại…")
+            openCamera(st)
+        }
+    }
+
     // ---------------------------------------------------------------- still callbacks
 
     override fun onSaved(uri: Uri, thumb: Bitmap, millis: Long) {

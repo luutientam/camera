@@ -54,7 +54,7 @@ class StillProcessor(
     private var yTex = 0
     private var uvTex = 0
     private val fbos = HashMap<Long, IntArray>()
-    @Volatile private var pending = 0
+    private val pending = java.util.concurrent.atomic.AtomicInteger(0)
 
     init {
         handler.post {
@@ -79,8 +79,7 @@ class StillProcessor(
         } finally {
             image.close()
         }
-        pending++
-        listener.onQueueChanged(pending)
+        listener.onQueueChanged(pending.incrementAndGet())
         val job = Job(y, uv, w, h, rotation, mirror, aspect, state, lm9, nightShoulder, lookName, result, location)
         handler.post { run(job) }
     }
@@ -117,10 +116,14 @@ class StillProcessor(
 
     private fun run(job: Job) {
         val t0 = System.currentTimeMillis()
+        var tl = t0
+        val laps = StringBuilder()
+        fun lap(name: String) { val n = System.currentTimeMillis(); laps.append(name).append(' ').append(n - tl).append("ms "); tl = n }
         var styleVersion = 0
         try {
             egl!!.makeCurrent()
             uploadYuv(job)
+            lap("upload")
             val rot = ((job.rotation % 360) + 360) % 360
             val tex = rotationMatrix(rot, job.mirror)
             val rw = if (rot % 180 == 0) job.width else job.height
@@ -131,8 +134,10 @@ class StillProcessor(
             if (state.style || job.lm9) {
                 val hw = rw / 2; val hh = rh / 2
                 val half = renderToBuffer(tex, LookState.BYPASS, hw, hh, rw.toFloat() / rh)
+                lap("half")
                 if (state.style) {
                     val maps = m9()?.maps(half, hw, hh, rw, rh, temporal = false)
+                    lap("m9 maps")
                     if (maps != null) {
                         styleVersion = engine.publishStillStyle(maps)
                         state = state.copy(styleVersion = styleVersion)
@@ -154,11 +159,15 @@ class StillProcessor(
             val cv = (1f - outH.toFloat() / rh) / 2f
             state = state.copy(crop = floatArrayOf(cu, cv, 1f - cu, 1f - cv))
             val buf = renderToBuffer(tex, state, outW, outH, rw.toFloat() / rh)
+            lap("full render")
             val bmp = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
             bmp.copyPixelsFromBuffer(buf)
             if (job.nightShoulder) NightHighlights.apply(bmp)
+            lap("bitmap")
 
             val uri = PhotoSaver.save(context, bmp, PhotoSaver.Meta(job.result, job.lookName, location = job.location))
+            lap("save")
+            Log.i(TAG, "${job.lookName} ${outW}x$outH: $laps")
             val thumbW = 240
             val thumb = Bitmap.createScaledBitmap(bmp, thumbW, thumbW * bmp.height / bmp.width, true)
             bmp.recycle()
@@ -169,8 +178,7 @@ class StillProcessor(
         } finally {
             if (styleVersion != 0) engine.release(styleVersion)
             if (job.state.bankKey != null) engine.release(job.state.bankVersion)
-            pending--
-            listener.onQueueChanged(pending)
+            listener.onQueueChanged(pending.decrementAndGet())
         }
     }
 

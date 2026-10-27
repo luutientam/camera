@@ -41,6 +41,8 @@ class CameraController(context: Context, private val listener: Listener) {
         fun onPreviewResult(result: TotalCaptureResult)
         fun onStill(image: Image, result: TotalCaptureResult, info: Info, request: StillRequest)
         fun onError(message: String)
+        /** The device or session died; the preview is frozen until the camera is reopened. */
+        fun onFatal(cameraId: String, message: String)
         fun onShutter()
     }
 
@@ -154,7 +156,7 @@ class CameraController(context: Context, private val listener: Listener) {
 
         override fun onError(camera: CameraDevice, error: Int) {
             camera.close(); if (device == camera) device = null
-            listener.onError("camera error $error")
+            listener.onFatal(camera.id, "camera error $error")
         }
     }
 
@@ -170,7 +172,7 @@ class CameraController(context: Context, private val listener: Listener) {
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    listener.onError("session configuration failed")
+                    listener.onFatal(camera.id, "session configuration failed")
                 }
             })
         camera.createCaptureSession(config)
@@ -181,18 +183,39 @@ class CameraController(context: Context, private val listener: Listener) {
         val b = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
         b.addTarget(previewSurface!!)
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        b.set(CaptureRequest.CONTROL_AF_MODE, continuousAf())
         b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, previewFpsRange())
-        b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
-        b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
-        b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
-        b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
-        b.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE)
+        b.setIf(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
+            CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+        b.setIf(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON,
+            CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+        b.setIf(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST,
+            CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+        b.setIf(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST, CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+        b.setIf(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE,
+            CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES)
         applyCommon(b)
         previewBuilder = b
         repeat()
+    }
+
+    /**
+     * Sets [key] only when the device lists [value] in [available]. The Xperia front camera has no
+     * OIS and no AF, and its HAL rejects the whole request (-22) for an unsupported mode.
+     */
+    private fun CaptureRequest.Builder.setIf(key: CaptureRequest.Key<Int>, value: Int, available: CameraCharacteristics.Key<IntArray>) {
+        if (info?.characteristics?.get(available)?.contains(value) == true) set(key, value)
+    }
+
+    private fun hasAf(): Boolean =
+        info?.characteristics?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.contains(CameraMetadata.CONTROL_AF_MODE_AUTO) == true
+
+    private fun continuousAf(): Int {
+        val modes = info?.characteristics?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: return CameraMetadata.CONTROL_AF_MODE_OFF
+        return if (CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+        else CameraMetadata.CONTROL_AF_MODE_OFF
     }
 
     private fun previewFpsRange(): Range<Int> {
@@ -208,7 +231,7 @@ class CameraController(context: Context, private val listener: Listener) {
         b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evIndex)
         val region = meteringRegion
         if (region != null) {
-            b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+            if (hasAf()) b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
             b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
         }
     }
@@ -218,6 +241,11 @@ class CameraController(context: Context, private val listener: Listener) {
         val b = previewBuilder ?: return
         try {
             s.setRepeatingRequest(b.build(), previewCallback, handler)
+        } catch (e: IllegalStateException) {
+            // Device closed under us (HAL error): drop the dead session so later calls are no-ops.
+            Log.w(TAG, "setRepeatingRequest: ${e.message}")
+            session = null
+            info?.let { listener.onFatal(it.id, e.message ?: "camera closed") }
         } catch (e: Exception) {
             Log.w(TAG, "setRepeatingRequest", e)
         }
@@ -274,8 +302,9 @@ class CameraController(context: Context, private val listener: Listener) {
             val region = MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX - 1)
             meteringRegion = region
             try {
-                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
                 applyCommon(b)
+                if (!hasAf()) { repeat(); return@post }
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
                 b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
                 s.capture(b.build(), null, handler)
                 b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
@@ -293,7 +322,7 @@ class CameraController(context: Context, private val listener: Listener) {
         handler.post {
             meteringRegion = null
             val b = previewBuilder ?: return@post
-            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            b.set(CaptureRequest.CONTROL_AF_MODE, continuousAf())
             b.set(CaptureRequest.CONTROL_AF_REGIONS, null)
             b.set(CaptureRequest.CONTROL_AE_REGIONS, null)
             repeat()
@@ -314,14 +343,16 @@ class CameraController(context: Context, private val listener: Listener) {
         val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
         b.addTarget(reader.surface)
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        b.set(CaptureRequest.CONTROL_AF_MODE, previewBuilder?.get(CaptureRequest.CONTROL_AF_MODE)
-            ?: CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        b.set(CaptureRequest.CONTROL_AF_MODE, previewBuilder?.get(CaptureRequest.CONTROL_AF_MODE) ?: continuousAf())
         b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-        b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)
-        b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_HIGH_QUALITY)
-        b.set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CameraMetadata.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
-        b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        b.setIf(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY,
+            CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+        b.setIf(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_HIGH_QUALITY, CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+        b.setIf(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CameraMetadata.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY,
+            CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES)
+        b.setIf(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON,
+            CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
         applyCommon(b)
         val token = req.copy(zoom = zoom)
         try {

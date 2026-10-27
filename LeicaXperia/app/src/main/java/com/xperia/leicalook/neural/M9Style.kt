@@ -40,6 +40,7 @@ class M9Style private constructor(
     private var smooth: FloatArray? = null
     private var smoothRes: FloatArray? = null
     private var smoothKey = 0L
+    private var input: FloatBuffer? = null
 
     /**
      * Runs the encoder on an upright RGBA8 frame (row 0 = top) and returns maps for an output of
@@ -47,14 +48,21 @@ class M9Style private constructor(
      */
     fun maps(rgba: ByteBuffer, w: Int, h: Int, outW: Int, outH: Int, temporal: Boolean): Maps? = synchronized(lock) {
         val t0 = System.nanoTime()
-        val input = FloatBuffer.allocate(3 * w * h)
+        // The small preview input is reused every grab; the large still input is not kept around.
+        val input = if (!temporal) FloatBuffer.allocate(3 * w * h)
+            else this.input?.takeIf { it.capacity() == 3 * w * h } ?: FloatBuffer.allocate(3 * w * h).also { this.input = it }
+        input.clear()
         val plane = w * h
-        rgba.position(0)
+        // Bulk copy, then convert from the array: per-element ByteBuffer/FloatBuffer calls are ~10x slower.
+        val px = ByteArray(plane * 4)
+        rgba.position(0); rgba.get(px); rgba.position(0)
+        val f = FloatArray(plane * 3)
         for (i in 0 until plane) {
-            input.put(i, (rgba.get(i * 4).toInt() and 0xff) / 255f)
-            input.put(plane + i, (rgba.get(i * 4 + 1).toInt() and 0xff) / 255f)
-            input.put(2 * plane + i, (rgba.get(i * 4 + 2).toInt() and 0xff) / 255f)
+            f[i] = (px[i * 4].toInt() and 0xff) * INV255
+            f[plane + i] = (px[i * 4 + 1].toInt() and 0xff) * INV255
+            f[2 * plane + i] = (px[i * 4 + 2].toInt() and 0xff) * INV255
         }
+        input.put(f); input.flip()
         val tensor = OnnxTensor.createTensor(env, input, longArrayOf(1, 3, h.toLong(), w.toLong()))
         val (grid, gw, gh, res, rw, rh) = tensor.use {
             session.run(mapOf("lowres" to it)).use { r ->
@@ -97,13 +105,14 @@ class M9Style private constructor(
     companion object {
         private const val TAG = "M9Style"
         private const val DEBUG = false
+        private const val INV255 = 1f / 255f
         /** Long side of the network input; the port feeds the encoder a ~256 px thumbnail. */
         const val LOWRES_LONG = 256
 
         fun create(context: Context, engine: LookEngine): M9Style? = try {
             val env = OrtEnvironment.getEnvironment()
             val opts = OrtSession.SessionOptions().apply {
-                setIntraOpNumThreads(2)
+                setIntraOpNumThreads(4)   // SM8450: 1 X2 + 3 A710 big cores
                 setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             }
             val bytes = context.assets.open("models/m9_distill_maps.onnx").use { it.readBytes() }

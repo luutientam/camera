@@ -60,6 +60,8 @@ class PreviewRenderer(
     private var grabTexW = 0
     private var grabTexH = 0
     private var grabRead: ByteBuffer? = null
+    /** Reused: the next grab only starts after the listener calls [grabDone]. */
+    private var grabOut: ByteBuffer? = null
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         oesTex = Gl.genTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES)
@@ -109,6 +111,7 @@ class PreviewRenderer(
             GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, grabTex, 0)
             grabTexW = w; grabTexH = h
             grabRead = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+            grabOut = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
         }
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, grabFbo)
         GLES30.glViewport(0, 0, w, h)
@@ -118,7 +121,8 @@ class PreviewRenderer(
         GLES30.glReadPixels(0, 0, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, rb)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         // readPixels row 0 is the bottom of the displayed image: flip to top-first.
-        val out = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+        val out = grabOut!!
+        out.clear()
         val row = ByteArray(w * 4)
         for (y in 0 until h) {
             rb.position((h - 1 - y) * w * 4); rb.get(row); out.put(row)

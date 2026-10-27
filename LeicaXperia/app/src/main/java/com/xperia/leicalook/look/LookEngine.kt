@@ -22,6 +22,8 @@ class LookEngine(private val assets: AssetManager) : LookTextures.Source {
     private val bankLuts = ConcurrentHashMap<Int, Lut3D>()
     private val styleMaps = ConcurrentHashMap<Int, M9Style.Maps>()
     private val versions = AtomicInteger(0)
+    /** Versions owned by queued stills; never pruned by the preview until [release]. */
+    private val pinned = ConcurrentHashMap.newKeySet<Int>()
 
     @Volatile var bank: BankResult = BankResult(0, null); private set
     @Volatile var currentStyleVersion = 0; private set
@@ -45,19 +47,20 @@ class LookEngine(private val assets: AssetManager) : LookTextures.Source {
         val lux = (scene?.luxIndex ?: 200f).roundToInt()
         val cct = (scene?.cct ?: 5000f).roundToInt()
         if (asset == lastKey && abs(lux - lastLux) < 3 && abs(cct - lastCct) < 40 && abs(zoom - lastZoom) < 0.05f) return bank
-        val r = blend(asset, lux, cct, zoom)
-        bankLuts.keys.filter { it < r.version - 6 }.forEach { bankLuts.remove(it) }
+        val r = blend(asset, lux, cct, zoom, still = false)
+        bankLuts.keys.filter { it < r.version - 6 && it !in pinned }.forEach { bankLuts.remove(it) }
         lastKey = asset; lastLux = lux; lastCct = cct; lastZoom = zoom
         bank = r
         return r
     }
 
     /** One-off blend for a still (its own exposure/AWB); kept until replaced by later versions. */
-    fun blend(asset: String, lux: Int, cct: Int, zoom: Float): BankResult {
+    fun blend(asset: String, lux: Int, cct: Int, zoom: Float, still: Boolean = true): BankResult {
         val b = bank(asset)
         val data = FloatArray(b.grid * b.grid * b.grid * 3)
         b.lut("common", lux, cct, data)
         val v = versions.incrementAndGet()
+        if (still) pinned += v
         bankLuts[v] = Lut3D.fromFloats(b.grid, data)
         return BankResult(v, if (b.hasShading()) b.shading(zoom, lux, cct) else null)
     }
@@ -65,7 +68,7 @@ class LookEngine(private val assets: AssetManager) : LookTextures.Source {
     fun publishStyle(maps: M9Style.Maps): Int {
         val v = versions.incrementAndGet()
         styleMaps[v] = maps
-        styleMaps.keys.filter { it < v - 6 && it != currentStyleVersion }.forEach { styleMaps.remove(it) }
+        styleMaps.keys.filter { it < v - 6 && it != currentStyleVersion && it !in pinned }.forEach { styleMaps.remove(it) }
         currentStyleVersion = v
         return v
     }
@@ -73,11 +76,13 @@ class LookEngine(private val assets: AssetManager) : LookTextures.Source {
     /** Registers maps for a single still without changing the preview's current version. */
     fun publishStillStyle(maps: M9Style.Maps): Int {
         val v = versions.incrementAndGet()
+        pinned += v
         styleMaps[v] = maps
         return v
     }
 
     fun release(version: Int) {
+        pinned -= version
         styleMaps.remove(version)
         bankLuts.remove(version)
     }
